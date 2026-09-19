@@ -783,8 +783,15 @@ def execute_director_plan_core(
 
         # Stock official inputs first (refs / source video / keyframes).
         # prev_tail is unused for r2v/v2v/rv2v here — MC pins after conditioning.
+        # [临时埋点] 定位上下文编码阶段的耗时分布，查清后移除。
+        _t_prep = time.perf_counter()
         first_frame, last_frame, ref_images, ref_videos, ref_audios, ref_video_audios = _build_minimax_inputs(
             plan, seg, clip_frames=clip_frames, ctx_w=ctx_w, ctx_h=ctx_h, prev_tail=None,
+        )
+        _t_build = time.perf_counter()
+        log.info(
+            "H3Director[prep] seg %d: build_inputs=%.1fs",
+            seg.index + 1, _t_build - _t_prep,
         )
 
         # i2v with an explicit new start image = fresh anchor (skip motion context).
@@ -831,6 +838,11 @@ def execute_director_plan_core(
             ref_image_size=official_ref_image_size(resolve_ref_image_size(seg, plan)),
         )
         cond_s = time.perf_counter() - t_cond
+        _t_cond_end = time.perf_counter()
+        log.info(
+            "H3Director[prep] seg %d: build_inputs=%.1fs conditioning=%.1fs",
+            seg.index + 1, _t_build - _t_prep, cond_s,
+        )
 
         trim_frames = 0
         after_shift = None
@@ -1061,6 +1073,13 @@ def execute_director_plan_core(
                     else ""
                 )
             )
+
+        _t_all = time.perf_counter()
+        log.info(
+            "H3Director[prep] seg %d: build=%.1fs cond=%.1fs motion_context=%.1fs TOTAL=%.1fs",
+            seg.index + 1, _t_build - _t_prep, cond_s,
+            _t_all - _t_cond_end, _t_all - _t_prep,
+        )
 
         report_director_progress(
             node_id, segment_index=progress_index, segment_total=seg_total,
@@ -1491,7 +1510,7 @@ def execute_director_plan_core(
                     if precise_segment_memory
                     else (),
                     pool=_model_pool,
-                )
+                    )
             try:
                 chunk, audio_dict, pre_chunk = _run_one_segment(
                     seg, progress_index=progress_pos[seg.index]
