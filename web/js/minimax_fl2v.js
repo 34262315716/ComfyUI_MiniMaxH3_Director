@@ -818,6 +818,7 @@ export function stripFl2vPromptBody(text) {
 }
 
 export function flushFl2vPromptDraft(editor) {
+    if (editor?._suspendPromptFlush) return;
     const ui = editor?.fl2vUi;
     if (!ui?.prompt && !ui?.negative) return;
     const shots = editor.timeline?.shots || [];
@@ -1187,7 +1188,11 @@ function renderFl2vShotCards(editor) {
         if (contInput) {
             const applyCont = (enabled) => {
                 contInput.checked = !!enabled;
+                // syncFl2vFromShots() replaces shot objects without re-rendering cards,
+                // so the captured `shot` may be stale — always write the live one too.
                 shot.continuityFromPrev = !!enabled;
+                const liveShot = editor.timeline?.shots?.[i];
+                if (liveShot) liveShot.continuityFromPrev = !!enabled;
                 if (Array.isArray(editor.timeline?.segments) && editor.timeline.segments[i]) {
                     editor.timeline.segments[i].continuityFromPrev = !!enabled;
                 }
