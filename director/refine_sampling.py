@@ -855,6 +855,40 @@ def _relock_continue_refine(
     return locked, True
 
 
+def _evict_first_pass_model(model, *, refine_model, vae, pack) -> None:
+    """一采用完，就把一采模型卸掉，给二采腾地方。
+
+    ⚠ 为什么必须做：一采模型和二采模型是**两个独立的 ModelPatcher**（各自带
+    自己那套 LoRA / 注意力补丁），各占一份完整权重副本 —— 本机实测日志里两次
+    ``prepared for dynamic VRAM loading. 19995MB Staged`` 的 patch 数分别是
+    208 / 258，就是两份。二采上场前不先卸一采，两份同时驻留（+19.35G），
+    叠上编码器与 VAE 直接压爆内存，连带后面导出/拼接阶段一起卡死。
+
+    一采模型在本函数后续路径里**不再被引用**（已逐行核对），所以卸它是安全的。
+    值不值得卸仍由 ``should_evict()`` 按物理内存判：内存宽裕时返回 False、
+    一个都不卸，行为与从前一致。
+    """
+    if refine_model is model:
+        return
+    try:
+        from .vram_cleanup import cleanup_segment_vram
+    except Exception as exc:
+        log.debug("first-pass model eviction skipped (import): %s", exc)
+        return
+
+    up = (pack or {}).get("upscale_model")
+    pool = {"refine_model": refine_model, "vae": vae}
+    keep = [p for p in (refine_model, vae) if p is not None]
+    if up is not None:
+        pool["upscale_model"] = up
+        keep.append(up)
+    try:
+        cleanup_segment_vram(enabled=True, unload_models=True, keep=keep, pool=pool)
+        log.info("H3Director[vram] first-pass model released before refine")
+    except Exception as exc:
+        log.debug("first-pass model eviction skipped: %s", exc)
+
+
 def apply_segment_refine(
     plan,
     seg,
@@ -921,6 +955,11 @@ def apply_segment_refine(
     work = dict(samples) if pin_frames > 0 else _latent_without_mask(samples)
     refine_positive = positive
     last_ok = samples
+
+    # ★ 一采用完 → 二采（放大 / 精修）上场之前，先把一采模型卸掉。
+    #   二采模型是两个独立副本里的另一份，不卸就是两份 19.35G 同时驻留。
+    _evict_first_pass_model(model, refine_model=refine_model, vae=vae, pack=pack)
+
     try:
         if refine_needs_canvas(pack):
             tw, th = _resolve_refine_canvas(plan, pack)

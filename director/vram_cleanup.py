@@ -172,10 +172,24 @@ def _ram_total():
 
 
 def _patcher_bytes(patcher) -> int:
-    try:
-        return int(patcher.model_size())
-    except Exception:
-        return 0
+    """模型权重体积。
+
+    ⚠ 必须解 ``.patcher``：``CLIP`` 是包装对象，真正的 ModelPatcher 挂在
+    ``self.patcher`` 上，而 ``CLIP`` **没有** ``model_size()``（只有 ``VAE`` 有）。
+    直接调会抛 AttributeError、被吞成 0 —— 于是整个文本编码器的体积
+    （本机 15.34G）在 ``should_evict()`` 里等于不存在，判据永远偏小。
+    ``_collect_vbars()`` 早就解了这一层，这里当初漏了。
+    """
+    for cand in (patcher, getattr(patcher, "patcher", None)):
+        if cand is None:
+            continue
+        try:
+            size = int(cand.model_size())
+        except Exception:
+            continue
+        if size > 0:
+            return size
+    return 0
 
 
 def should_evict(pool=None) -> bool:
@@ -711,6 +725,33 @@ def _release_aimdo_vram(mm, vbars=()) -> None:
     )
 
 
+def _cleanup_prefetch_queues() -> None:
+    """对齐 ComfyUI 官方的「每节点收尾」第 2 步 —— **必须无条件调用**。
+
+    ``execution.py`` 的 per-node ``finally`` 里它排在 ``analyze()`` 之后、
+    ``reset_cast_buffers()`` 之前，**没有任何前置条件**。
+
+    为什么不能挂进 ``should_evict()``：预取队列持有模块引用和 fault 出来的
+    ``_v_block`` 地址范围，这些页在 ``vbar_fault()`` 末尾被 ``rp->pin_count++``
+    钉住；只要 pin 没解，C 层 ``mod1(..., do_free=true, do_unpin=false)`` 就放不掉
+    页，于是 ``vbar_free_memory()`` 只能把 ``watermark`` 一路降下去、页一个不还。
+    而 ``vbars_reset_watermark_limits()`` 正好把 ``watermark_limit`` 置 0，
+    ``watermark`` 一旦触 0 就再也回不去（唯一能把它顶回 ``nr_pages`` 的
+    ``vbar_prioritize()`` 只在**模型加载**时调用）—— 之后 ``vbar_fault()`` 直接判
+    OOM，每一层退回 host→device 拷贝：GPU 100% 却只有两成功耗。
+
+    **这跟"内存够不够"无关**，所以不该被 ``should_evict()`` 连带跳过。
+    单段运行同样会产生 pin，同样必须清。
+    """
+    try:
+        import comfy.model_prefetch as _mp
+
+        _mp.cleanup_prefetch_queues()
+        log.info("H3Director[vram] prefetch queues cleaned")
+    except Exception as exc:
+        log.debug("cleanup_prefetch_queues skipped: %s", exc)
+
+
 def cleanup_segment_vram(
     *,
     enabled: bool = True,
@@ -727,9 +768,30 @@ def cleanup_segment_vram(
     """
     if not enabled:
         return
+
+    # ★ 无条件先清预取队列（2026-09-20：从 should_evict 闸门后面挪出来）。
+    #   它是"正确性"而不是"内存策略"—— 判"内存够就别卸"时不该连它一起跳过。
+    _cleanup_prefetch_queues()
+
     if unload_models and adaptive and not should_evict(pool):
-        log.debug(
-            "H3Director[vram] skip segment cleanup (loaded models fit in RAM)"
+        # 诊断埋点（2026-09-20）：原先是 log.debug，INFO 级别下完全静默，
+        # 导致"清理到底跑没跑、为什么没跑"无法从日志判断。这里改报 WARNING
+        # 并把逐角色体积摊开 —— 尤其是 clip 会不会算出 0。
+        _ram = _ram_total()
+        _detail = []
+        _total = 0
+        for _role, _p in (pool or {}).items():
+            _n = _patcher_bytes(_p)
+            _total += _n
+            _detail.append("%s=%.2fG" % (_role, _n / (1024 ** 3)))
+        log.warning(
+            "H3Director[vram] SKIP segment cleanup: counted=%.2fG <= "
+            "threshold=%.2fG (ram=%.2fG x %.2f) | %s",
+            _total / (1024 ** 3),
+            _ram / (1024 ** 3) * EVICT_RAM_RATIO,
+            _ram / (1024 ** 3),
+            EVICT_RAM_RATIO,
+            ", ".join(_detail) if _detail else "(pool 为空)",
         )
         return
     gc.collect()
@@ -748,28 +810,8 @@ def cleanup_segment_vram(
         _evict_dead_loaded_models()
         gc.collect()
 
-        # ★ 对齐 ComfyUI 的「每节点重置」。
-        #
-        # execution.py:546-554 的 finally 里一共做四件事：
-        #     analyze()                      （仅 --verbose DEBUG 时）
-        #     cleanup_prefetch_queues()      ★ 导演台原先从来没做过这一步
-        #     reset_cast_buffers()           ← 后面 _release_aimdo_vram 里做了
-        #     vbars_reset_watermark_limits() ← 同上
-        #
-        # 为什么漏掉的这一步是要害：预取队列持有模块引用和 fault 出来的
-        # ``_v_block`` 地址范围，而导演台是「一次节点执行内循环所有分段」，
-        # 这套重置整条片子只跑一次 —— 段1 采样撑起来的预取状态没人清，
-        # 段2 起的编码器就一直拿不到显存窗口。
-        # 小莫抓栈时命中的 ``prefetch_queue_pop``（llama.py:908）正是这条路径。
-        #
-        # 官方是在**每个节点之后**无条件调用它，所以放在段边界调用是安全的。
-        try:
-            import comfy.model_prefetch as _mp
-            _mp.cleanup_prefetch_queues()
-            log.info("H3Director[vram] prefetch queues cleaned")
-        except Exception as exc:
-            log.debug("cleanup_prefetch_queues skipped: %s", exc)
-
+        # 预取队列已在函数入口无条件清过（见 _cleanup_prefetch_queues）。
+        # 原先它在这里、在 should_evict() 闸门之后，会被一并跳过。
         mm.soft_empty_cache()
         _release_aimdo_vram(mm, vbars=vbars)
     except Exception as exc:

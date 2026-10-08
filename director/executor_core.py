@@ -1176,8 +1176,15 @@ def execute_director_plan_core(
             phase="context_encode", phase_value=1, phase_max=1, **meta,
         )
 
-        # Single / last segment: skip — official H3 also keeps models loaded.
-        if clear_vram_between_segments and seg_total > 1:
+        # 上下文编码用完 → 采样前收缩一次。
+        #
+        # 2026-09-20：去掉原先的 `and seg_total > 1`。
+        # 后果是「只跑一段」时整块被跳过 —— 编码器 15.34G 一直占着，生成模型装不
+        # 进来（实测日志：`Requested to load MiniMaxH3` 后紧跟 `0 models unloaded.`）。
+        # 值不值得卸本就该由 should_evict() 按物理内存判：内存宽裕时它自然返回
+        # False、一个都不卸，不该在这里写死。末段同样受益 —— 本段之后不再需要
+        # 编码器，卸掉正好给采样腾地方。
+        if clear_vram_between_segments:
             # 上下文编码用完了：按下个阶段（采样）的需要重新收缩一次。
             #
             # 编码器和生成模型通常都很大，内存未必装得下它们同时在场；
@@ -1671,7 +1678,13 @@ def execute_director_plan_core(
                 f"{mp4_export_kind(mp4_path)} saved → {mp4_path}"
             )
 
-        if clear_vram_between_segments and progress_index < seg_total - 1:
+        # 段末清理。2026-09-20：去掉原先的 `and progress_index < seg_total - 1`。
+        # 那个条件让"最后一段"（以及只跑一段时的那一段）收尾后不清理 —— 而段跑完
+        # 紧接着就是主循环里给未选中的段做缓存填充与接缝亮度对齐，那些步骤只需要
+        # 图像张量、完全不需要模型，却要跟 19.35G 的二采模型 + 15.34G 编码器抢内存。
+        # 实测就是卡在这里（日志停在接缝对齐那几行）。
+        # 卸不卸仍由 should_evict() 按物理内存判：内存宽裕时它返回 False、一个都不卸。
+        if clear_vram_between_segments:
             cleanup_segment_vram(enabled=True)
 
         reports.append(
