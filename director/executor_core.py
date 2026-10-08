@@ -529,7 +529,7 @@ def execute_director_plan_core(
         reports.append("Live preview: OFF — 跳过采样预览。")
     shift_cache = ShiftedModelCache()
     if clear_vram_between_segments:
-        reports.append("VRAM: 段间清理显存已开启（最后一段不清理）。")
+        reports.append("VRAM: 段间清理显存已开启（每段跑完都按内存判据决定卸载，含最后一段）。")
     if clear_vram_before_refine:
         reports.append("VRAM: 二采前清理显存已开启（一采结束后、二采开始前卸载模型）。")
     if clear_vram_before_face_refine:
@@ -1696,7 +1696,7 @@ def execute_director_plan_core(
             f"Segment {ui_idx + 1} timing: "
             f"cond={cond_s:.1f}s sample={sample_s:.1f}s decode={decode_s:.1f}s "
             f"cache={'skipped' if not write_cache else f'{cache_s:.1f}s'} "
-            f"cleanup={'skipped' if progress_index >= seg_total - 1 else 'between-seg'}"
+            f"cleanup={'on' if clear_vram_between_segments else 'off'}"
         )
         log.info(
             "MiniMax H3 Director segment %d/%d done (%d frames, task=%s)",
